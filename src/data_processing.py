@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 
 
 def data_loader(n_training, device):
-    data = np.load("dataset/tiny_nerf_data.npz")
+    # data = np.load("dataset/tiny_nerf_data.npz")
+    data = np.load("/data2/cll/zju/cv/cv-2022/Homework4/dataset/tiny_nerf_data.npz")
     images = data["images"]
     poses = data["poses"]
     focal = data["focal"]

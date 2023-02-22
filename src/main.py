@@ -1,3 +1,4 @@
+import pickle
 from tqdm import tqdm
 
 import numpy as np
@@ -25,9 +26,9 @@ far = settings.far
 kwargs_sample_stratified = settings.kwargs_sample_stratified
 kwargs_sample_hierarchical = settings.kwargs_sample_hierarchical
 chunksize = settings.chunksize
+device = settings.device
 
 n_training = 100
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper = init_models()
 images, poses, focal = data_loader(n_training, device)
 
@@ -109,11 +110,12 @@ def train():
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            psnr = -10. * torch.log10(loss)
+            psnr = -10.0 * torch.log10(loss)
             train_psnrs.append(psnr.item())
+            pbar.set_description("Loss: {:.4f}".format(loss.item()))
 
             # Evaluate testimg at given display rate.
-            if i % display_rate == 0:
+            if (i + 1) % display_rate == 0:
                 model.eval()
                 height, width = testimg.shape[:2]
                 rays_o, rays_d = get_rays(height, width, focal, testpose)
@@ -136,31 +138,30 @@ def train():
 
                 rgb_predicted = outputs['rgb_map']
                 loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
-                pbar.set_description("Loss: {:.4f}".format(loss.item()))
                 val_psnr = -10. * torch.log10(loss)
                 val_psnrs.append(val_psnr.item())
                 iternums.append(i)
 
                 # Plot example outputs
-                # fig, ax = plt.subplots(1, 4, figsize=(24, 4), gridspec_kw={'width_ratios': [1, 1, 1, 3]})
-                # ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
-                # ax[0].set_title(f'Iteration: {i}')
-                # ax[1].imshow(testimg.detach().cpu().numpy())
-                # ax[1].set_title(f'Target')
-                # ax[2].plot(range(0, i + 1), train_psnrs, 'r')
-                # ax[2].plot(iternums, val_psnrs, 'b')
-                # ax[2].set_title('PSNR (train=red, val=blue')
-                # z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
-                # z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
-                # if 'z_vals_hierarchical' in outputs:
-                #     z_vals_hierarch = outputs['z_vals_hierarchical'].view(
-                #         (-1, n_samples_hierarchical))
-                #     z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
-                # else:
-                #     z_sample_hierarch = None
-                # plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
-                # ax[3].margins(0)
-                # plt.show()
+                fig, ax = plt.subplots(1, 4, figsize=(24, 4), gridspec_kw={'width_ratios': [1, 1, 1, 3]})
+                ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
+                ax[0].set_title(f'Iteration: {i}')
+                ax[1].imshow(testimg.detach().cpu().numpy())
+                ax[1].set_title(f'Target')
+                ax[2].plot(range(0, i + 1), train_psnrs, 'r')
+                ax[2].plot(iternums, val_psnrs, 'b')
+                ax[2].set_title('PSNR (train=red, val=blue')
+                z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
+                z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
+                if 'z_vals_hierarchical' in outputs:
+                    z_vals_hierarch = outputs['z_vals_hierarchical'].view(
+                        (-1, n_samples_hierarchical))
+                    z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
+                else:
+                    z_sample_hierarch = None
+                plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
+                ax[3].margins(0)
+                plt.show()
 
             pbar.update(1)
 
@@ -181,14 +182,30 @@ def train():
     return True, train_psnrs, val_psnrs
 
 
+def save_models(model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper, settings):
+    # using pickle save all parameters
+    with open(settings.model_path, 'wb') as f:
+        pickle.dump(model.state_dict(), f)
+    with open(settings.fine_model_path, 'wb') as f:
+        pickle.dump(fine_model.state_dict(), f)
+    with open(settings.encode_path, 'wb') as f:
+        pickle.dump(encode.state_dict(), f)
+    with open(settings.encode_viewdirs_path, 'wb') as f:
+        pickle.dump(encode_viewdirs.state_dict(), f)
+    with open(settings.optimizer_path, 'wb') as f:
+        pickle.dump(optimizer.state_dict(), f)
+    with open(settings.warmup_stopper_path, 'wb') as f:
+        pickle.dump(warmup_stopper.state_dict(), f)
+
+
 def main():
     settings = Settings()
     n_restarts = settings.n_restarts
-    n_restarts = 1
     for _ in range(n_restarts):
         model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper = init_models()
         success, train_psnrs, val_psnrs = train()
         if success and val_psnrs[-1] >= warmup_min_fitness:
+            save_models(model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper, settings)
             print('Training successful!')
             break
 

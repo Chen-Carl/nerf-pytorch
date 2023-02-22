@@ -101,23 +101,6 @@ def nerf_forward(
     viewdirs_encoding_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     chunksize: int = 2**15
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    """
-    input parameters:
-        rays_o: shape [N_rays, 3] origin of each ray
-        rays_d: shape [N_rays, 3] direction of each ray
-        near: float distance to near plane
-        far: float distance to far plane
-        encoding_fn: function that encodes a point into a vector
-        coarse_model: coarse model
-        kwargs_sample_stratified: dict of kwargs for stratified sampling
-        n_samples_hierarchical: int number of samples for hierarchical sampling
-        kwargs_sample_hierarchical: dict of kwargs for hierarchical sampling
-        fine_model: fine model
-        viewdirs_encoding_fn: function that encodes a view direction into a vector
-        chunksize: int size of chunks to split the input into
-    return:
-
-    """
     if kwargs_sample_stratified is None:
         kwargs_sample_stratified = {}
     if kwargs_sample_hierarchical is None:
@@ -134,8 +117,6 @@ def nerf_forward(
         batches_viewdirs = [None] * len(batches)
 
     # Coarse model pass.
-    # Split the encoded points into "chunks", run the model on all chunks, and
-    # concatenate the results (to avoid out-of-memory issues).
     predictions = []
     for batch, batch_viewdirs in zip(batches, batches_viewdirs):
         predictions.append(coarse_model(batch, viewdirs=batch_viewdirs))

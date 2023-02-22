@@ -57,5 +57,4 @@ def raw2outputs(
     # To composite onto a white background, use the accumulated alpha map.
     if white_bkgd:
         rgb_map = rgb_map + (1.0 - acc_map[..., None])
-
     return rgb_map, depth_map, acc_map, weights

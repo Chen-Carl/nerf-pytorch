@@ -12,19 +12,6 @@ def stratified_sample(
     perturb : Optional[bool] = True,
     inverse_depth : Optional[bool] = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    input parameters:
-        * rays_o: shape [N_rays, 3] origin of each ray
-        * rays_d: shape [N_rays, 3] direction of each ray
-        * near: float distance to near plane
-        * far: float distance to far plane
-        * n_samples: int number of samples
-        * perturb: bool whether to perturb the samples
-        * inverse_depth: bool whether to use inverse depth
-    return:
-        * pts: shape [N_rays, n_samples, 3] points along each ray
-        * z_vals: shape [N_rays, n_samples] depth values of each point
-    """
     t_vals = torch.linspace(0.0, 1.0, n_samples, device=rays_o.device)
     if not inverse_depth:
         z_vals = near * (1.0 - t_vals) + far * t_vals
@@ -50,19 +37,6 @@ def hierarchical_sample(
     n_samples : int,
     perturb : Optional[bool] = False
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    input parameters:
-        * rays_o: shape [N_rays, 3] origin of each ray
-        * rays_d: shape [N_rays, 3] direction of each ray
-        * z_vals: shape [N_rays, n_samples] depth values of each point
-        * weights: shape [N_rays, n_samples] weights of each point
-        * n_samples: int number of samples
-        * perturb: bool whether to perturb the samples
-    return:
-        * pts: shape [N_rays, n_samples * 2, 3] points along each ray
-        * z_vals_combined: shape [N_rays, n_samples * 2] depth values of each point
-        * new_z_samples: shape [N_rays, n_samples] new depth values of each point
-    """
     z_vals_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
     new_z_samples = sample_pdf(z_vals_mid, weights[..., 1:-1], n_samples, perturb=perturb)
     new_z_samples = new_z_samples.detach()
@@ -85,18 +59,29 @@ def sample_pdf(
         u = torch.rand(list(cdf.shape[:-1]) + [n_samples], device=cdf.device)
     else:
         u = torch.linspace(0.0, 1.0, n_samples, device=cdf.device)
+    # torch.Size([2500, 64])
     u = u.expand(list(cdf.shape[:-1]) + [n_samples])
+    # torch.Size([2500, 64])
     inds = torch.searchsorted(cdf, u, right=True)
-
+    # torch.Size([2500, 64])
     below = torch.clamp_min(inds - 1, 0)
+    # torch.Size([2500, 64])
     above = torch.clamp_max(inds, cdf.shape[-1] - 1)
     inds_g = torch.stack([below, above], dim=-1)
+    # torch.Size([2500, 64, 2])
 
     matched_shape = list(inds_g.shape[:-1]) + [cdf.shape[-1]]
+    # [2500, 64, 63]
     cdf_g = torch.gather(cdf.unsqueeze(-2).expand(matched_shape), -1, inds_g)
+    # torch.Size([2500, 64, 2])
     bins_g = torch.gather(bins.unsqueeze(-2).expand(matched_shape), -1, inds_g)
+    # torch.Size([2500, 64, 2])
     denom = cdf_g[..., 1] - cdf_g[..., 0]
+    # torch.Size([2500, 64])
     denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    # torch.Size([2500, 64])
     t = (u - cdf_g[..., 0]) / denom
+    # torch.Size([2500, 64])
     samples = bins_g[..., 0] + (bins_g[..., 1] - bins_g[..., 0]) * t
+    # torch.Size([2500, 64])
     return samples

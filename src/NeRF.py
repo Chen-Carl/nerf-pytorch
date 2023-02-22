@@ -13,12 +13,12 @@ class NeRF(nn.Module):
         d_viewdirs : Optional[int] = None,
     ):
         """
-        parameters:
-            d_input: dimension of input points
-            n_layers: number of layers
-            d_filter: dimension of hidden layers
-            skip: skip connections
-            d_viewdirs: dimension of view directions
+        input parameters:
+            * d_input: dimension of input points
+            * n_layers: number of layers
+            * d_filter: dimension of hidden layers
+            * skip: skip connections, default input reinjection at layer 4
+            * d_viewdirs: dimension of view directions
         """
         super().__init__()
         self.d_input = d_input
@@ -67,4 +67,3 @@ class NeRF(nn.Module):
             x = self.output(x)
             
         return x
-            

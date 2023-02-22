@@ -3,7 +3,7 @@ import torch
 class Settings:
     def __init__(self):
         # Device
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
 
         # Encoders
         self.d_input = 3             # Number of input dimensions
@@ -41,7 +41,7 @@ class Settings:
         self.chunksize = 2**14           # Modify as needed to fit in GPU memory
         self.center_crop = True          # Crop the center of image (one_image_per_)
         self.center_crop_iters = 50      # Stop cropping center after this many epochs
-        self.display_rate = 25           # Display test output every X epochs
+        self.display_rate = 1000         # Display test output every X epochs
 
         # Early Stopping
         self.warmup_iters = 100          # Number of iterations during warmup phase
@@ -57,3 +57,11 @@ class Settings:
         self.kwargs_sample_hierarchical = {
             'perturb': self.perturb
         }
+
+        # save model path
+        self.model_path = "model/nerf_coarse.pkl"
+        self.fine_model_path = "model/nerf_fine.pkl"
+        self.encode_path = "model/encode.pkl"
+        self.encode_viewdirs_path = "model/encode_viewdirs.pkl"
+        self.optimizer_path = "model/opklimizer.pkl"
+        self.warmup_stopper_path = "model/warmup_stopper.pkl"
