@@ -1,215 +1,152 @@
-import pickle
-from tqdm import tqdm
+import os
+import argparse
+import time
 
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
+from tqdm import tqdm
+from typing import Optional
+from matplotlib import pyplot as plt
+
+from nerf import NeRFWrapper
+from EarlyStopping import EarlyStopping
 from settings import Settings
-from data_processing import data_loader, get_rays
-from model import init_models, nerf_forward
-from utils import plot_samples, crop_center
+from datasets import load_dataset
 
-settings = Settings()
-n_iters = settings.n_iters
-one_image_per_step = settings.one_image_per_step
-center_crop = settings.center_crop
-center_crop_iters = settings.center_crop_iters
-batch_size = settings.batch_size
-display_rate = settings.display_rate
-warmup_iters = settings.warmup_iters
-warmup_min_fitness = settings.warmup_min_fitness
-n_samples_hierarchical = settings.n_samples_hierarchical
-n_samples = settings.n_samples
-near = settings.near
-far = settings.far
-kwargs_sample_stratified = settings.kwargs_sample_stratified
-kwargs_sample_hierarchical = settings.kwargs_sample_hierarchical
-chunksize = settings.chunksize
-device = settings.device
 
-n_training = 100
-model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper = init_models()
-images, poses, focal = data_loader(n_training, device)
+def render(model, settings, iter, dataset, train_psnrs, iternums, val_psnrs, img_id):
+    height = dataset.height
+    width = dataset.width
+    focal = dataset.focal
+    pose = dataset.poses[img_id]
+    rays_o, rays_d = dataset.get_rays(height, width, focal, pose)
+    rays_o = rays_o.reshape(-1, 3)
+    rays_d = rays_d.reshape(-1, 3)
+    outputs = model(rays_o, rays_d)
+
+    def plot_samples(
+        z_vals: torch.Tensor,
+        z_hierarch: Optional[torch.Tensor] = None,
+        ax: Optional[np.ndarray] = None
+    ):
+        """
+        Plot stratified and (optional) hierarchical samples.
+        """
+        y_vals = 1 + np.zeros_like(z_vals)
+        if ax is None:
+            ax = plt.subplot()
+        ax.plot(z_vals, y_vals, 'b-o')
+        if z_hierarch is not None:
+            y_hierarch = np.zeros_like(z_hierarch)
+            ax.plot(z_hierarch, y_hierarch, 'r-o')
+        ax.set_ylim([-1, 2])
+        ax.set_title('Stratified  Samples (blue) and Hierarchical Samples (red)')
+        ax.axes.yaxis.set_visible(False)
+        ax.grid(True)
+        return ax
+
+    fig, ax = plt.subplots(1, 4, figsize=(24, 4), gridspec_kw={'width_ratios': [1, 1, 1, 3]})
+    ax[0].imshow(outputs["rgb_map"].reshape([dataset.height, dataset.width, 3]).detach().cpu().numpy())
+    ax[0].set_title(f'Iteration: {iter + 1}')
+    ax[1].imshow(dataset.images[img_id].detach().cpu().numpy())
+    ax[1].set_title(f'Target')
+    ax[2].plot(range(0, iter + 1), train_psnrs, 'r')
+    ax[2].plot(iternums, val_psnrs, 'b')
+    ax[2].set_title('PSNR (train=red, val=blue')
+    z_vals_strat = outputs['z_vals_stratified'].view((-1, settings.n_samples))
+    z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
+    if 'z_vals_hierarchical' in outputs:
+        z_vals_hierarch = outputs['z_vals_hierarchical'].view(
+            (-1, settings.n_samples_hierarchical))
+        z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
+    else:
+        z_sample_hierarch = None
+    plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
+    ax[3].margins(0)
+    plt.show()
+    return outputs
 
 
 def train():
-    testimg_idx = 99
-    testimg, testpose = images[testimg_idx], poses[testimg_idx]
-    # Shuffle rays across all images.
-    if not one_image_per_step:
-        height, width = images.shape[1:3]
-        all_rays = torch.stack([
-            torch.stack(get_rays(height, width, focal, p), 0)
-            for p in poses[:n_training]
-        ], 0)
-        rays_rgb = torch.cat([all_rays, images[:, None]], 1)
-        rays_rgb = torch.permute(rays_rgb, [0, 2, 3, 1, 4])
-        rays_rgb = rays_rgb.reshape([-1, 3, 3])
-        rays_rgb = rays_rgb.type(torch.float32)
-        rays_rgb = rays_rgb[torch.randperm(rays_rgb.shape[0])]
-        i_batch = 0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local_rank", default=os.getenv("LOCAL_RANK", -1), type=int)
+    args = parser.parse_args()
+
+    torch.cuda.set_device(args.local_rank)
+    torch.distributed.init_process_group(backend="nccl")
+    device = torch.device("cuda", args.local_rank)
+
+    settings = Settings()
+    model = NeRFWrapper(settings)
+    optimizer = torch.optim.Adam(model.parameters(), lr=settings.lr)
+    warmup_stopper = EarlyStopping(patience=50)
+    loader, sampler, dataset = load_dataset(settings.batch_size, device)
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 1:
+        model = torch.nn.DataParallel(model, device_ids=[args.local_rank])
 
     train_psnrs = []
     val_psnrs = []
     iternums = []
-    with tqdm(total=n_iters) as pbar:
-        for i in range(n_iters):
+
+    with tqdm(total=settings.n_iters, position=args.local_rank * 2) as pbar:
+        for i in range(settings.n_iters):
             model.train()
+            sampler.set_epoch(i)
+            for rays_o, rays_d, rgb in loader:
+                outputs = model(rays_o, rays_d)
+                # Check for any numerical issues.
+                for k, v in outputs.items():
+                    if torch.isnan(v).any():
+                        print(f"! [Numerical Alert] {k} contains NaN.")
+                    if torch.isinf(v).any():
+                        print(f"! [Numerical Alert] {k} contains Inf.")
 
-            if one_image_per_step:
-                # Randomly pick an image as the target.
-                target_img_idx = np.random.randint(images.shape[0])
-                target_img = images[target_img_idx].to(device)
-                if center_crop and i < center_crop_iters:
-                    target_img = crop_center(target_img)
-                height, width = target_img.shape[:2]
-                target_pose = poses[target_img_idx].to(device)
-                rays_o, rays_d = get_rays(height, width, focal, target_pose)
-                rays_o = rays_o.reshape([-1, 3])
-                rays_d = rays_d.reshape([-1, 3])
-            else:
-                # Random over all images.
-                batch = rays_rgb[i_batch:i_batch + batch_size]
-                batch = torch.transpose(batch, 0, 1)
-                rays_o, rays_d, target_img = batch
-                height, width = target_img.shape[:2]
-                i_batch += batch_size
-                # Shuffle after one epoch
-                if i_batch >= rays_rgb.shape[0]:
-                    rays_rgb = rays_rgb[torch.randperm(rays_rgb.shape[0])]
-                    i_batch = 0
-            target_img = target_img.reshape([-1, 3])
+                loss = F.mse_loss(outputs["rgb_map"], rgb)
+                pbar.set_description("GPU {} Loss: {:.4f}".format(args.local_rank, loss.item()))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                psnr = -10.0 * torch.log10(loss)
+                train_psnrs.append(psnr.item())
 
-            # Run one iteration of TinyNeRF and get the rendered RGB image.
-            outputs = nerf_forward(
-                rays_o,
-                rays_d,
-                near,
-                far,
-                encode,
-                model,
-                kwargs_sample_stratified=kwargs_sample_stratified,
-                n_samples_hierarchical=n_samples_hierarchical,
-                kwargs_sample_hierarchical=kwargs_sample_hierarchical,
-                fine_model=fine_model,
-                viewdirs_encoding_fn=encode_viewdirs,
-                chunksize=chunksize
-            )
-
-            # Check for any numerical issues.
-            for k, v in outputs.items():
-                if torch.isnan(v).any():
-                    print(f"! [Numerical Alert] {k} contains NaN.")
-                if torch.isinf(v).any():
-                    print(f"! [Numerical Alert] {k} contains Inf.")
-
-            # Backprop!
-            rgb_predicted = outputs['rgb_map']
-            loss = torch.nn.functional.mse_loss(rgb_predicted, target_img)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            psnr = -10.0 * torch.log10(loss)
-            train_psnrs.append(psnr.item())
-            pbar.set_description("Loss: {:.4f}".format(loss.item()))
-
-            # Evaluate testimg at given display rate.
-            if (i + 1) % display_rate == 0:
+            if (i + 1) % settings.display_rate == 0:
                 model.eval()
-                height, width = testimg.shape[:2]
-                rays_o, rays_d = get_rays(height, width, focal, testpose)
-                rays_o = rays_o.reshape([-1, 3])
-                rays_d = rays_d.reshape([-1, 3])
-                outputs = nerf_forward(
-                    rays_o,
-                    rays_d,
-                    near,
-                    far,
-                    encode,
-                    model,
-                    kwargs_sample_stratified=kwargs_sample_stratified,
-                    n_samples_hierarchical=n_samples_hierarchical,
-                    kwargs_sample_hierarchical=kwargs_sample_hierarchical,
-                    fine_model=fine_model,
-                    viewdirs_encoding_fn=encode_viewdirs,
-                    chunksize=chunksize
-                )
+                img_id = 101
+                render(model, settings, i, dataset, train_psnrs, iternums, val_psnrs, img_id)
+                loss = F.mse_loss(outputs["rgb_map"], dataset.images[img_id].reshape(-1, 3))
+                val_psnr = -10.0 * torch.log10(loss)
+                val_psnrs.append(psnr.item())
 
-                rgb_predicted = outputs['rgb_map']
-                loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
-                val_psnr = -10. * torch.log10(loss)
-                val_psnrs.append(val_psnr.item())
-                iternums.append(i)
-
-                # Plot example outputs
-                fig, ax = plt.subplots(1, 4, figsize=(24, 4), gridspec_kw={'width_ratios': [1, 1, 1, 3]})
-                ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
-                ax[0].set_title(f'Iteration: {i}')
-                ax[1].imshow(testimg.detach().cpu().numpy())
-                ax[1].set_title(f'Target')
-                ax[2].plot(range(0, i + 1), train_psnrs, 'r')
-                ax[2].plot(iternums, val_psnrs, 'b')
-                ax[2].set_title('PSNR (train=red, val=blue')
-                z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
-                z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
-                if 'z_vals_hierarchical' in outputs:
-                    z_vals_hierarch = outputs['z_vals_hierarchical'].view(
-                        (-1, n_samples_hierarchical))
-                    z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
-                else:
-                    z_sample_hierarch = None
-                plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
-                ax[3].margins(0)
-                plt.show()
-
-            pbar.update(1)
 
             # Check PSNR for issues and stop if any are found.
-            if i == warmup_iters - 1:
-                if val_psnr < warmup_min_fitness:
+            if i == settings.warmup_iters - 1:
+                if val_psnr < settings.warmup_min_fitness:
                     print(
-                        f'Val PSNR {val_psnr} below warmup_min_fitness {warmup_min_fitness}. Stopping...'
+                        f'Val PSNR {val_psnr} below warmup_min_fitness {settings.warmup_min_fitness}. Stopping...'
                     )
-                    return False, train_psnrs, val_psnrs
-            elif i < warmup_iters:
+                    return False, train_psnrs, val_psnrs, None
+            elif i < settings.warmup_iters:
                 if warmup_stopper is not None and warmup_stopper(i, psnr):
                     print(
                         f'Train PSNR flatlined at {psnr} for {warmup_stopper.patience} iters. Stopping...'
                     )
-                    return False, train_psnrs, val_psnrs
+                    return False, train_psnrs, val_psnrs, None
 
-    return True, train_psnrs, val_psnrs
+            pbar.update(1)
 
-
-def save_models(model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper, settings):
-    # using pickle save all parameters
-    with open(settings.model_path, 'wb') as f:
-        pickle.dump(model.state_dict(), f)
-    with open(settings.fine_model_path, 'wb') as f:
-        pickle.dump(fine_model.state_dict(), f)
-    with open(settings.encode_path, 'wb') as f:
-        pickle.dump(encode.state_dict(), f)
-    with open(settings.encode_viewdirs_path, 'wb') as f:
-        pickle.dump(encode_viewdirs.state_dict(), f)
-    with open(settings.optimizer_path, 'wb') as f:
-        pickle.dump(optimizer.state_dict(), f)
-    with open(settings.warmup_stopper_path, 'wb') as f:
-        pickle.dump(warmup_stopper.state_dict(), f)
+    return True, train_psnrs, val_psnrs, model
 
 
 def main():
     settings = Settings()
-    n_restarts = settings.n_restarts
-    for _ in range(n_restarts):
-        model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper = init_models()
-        success, train_psnrs, val_psnrs = train()
-        if success and val_psnrs[-1] >= warmup_min_fitness:
-            save_models(model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper, settings)
-            print('Training successful!')
-            break
-
-    print("Done!")
+    for i in range(settings.n_restarts):
+        success, train_psnrs, val_psnrs, model = train()
+        if success and val_psnrs[-1] >= settings.warmup_min_fitness:
+            torch.save(model.state_dict(), "models/nerf_model_{}.pth".format(int(round(time.time() * 1000))))
+            print("Training successful. Model saved.")
 
 
 main()

@@ -79,6 +79,10 @@ regions that do not contribute to the rendered image are still sampled repeatedl
 
 ### 2.3 训练过程
 
+``` bash
+torchrun --nproc_per_node=NUM_GPUS src/main.py
+```
+
 随机选取一张图片生成光线，进行一次前向传播得到`outputs`，其中`rgb_predicted`是预测的颜色值，与原始图片相比较进行误差反向传播。
 
 ## 3 实验
