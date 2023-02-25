@@ -124,7 +124,7 @@ def train(args):
 
                 if args.local_rank == 0:
                     torch.save(model.state_dict(), "models/checkpoints/checkpoint_{}.pth".format(int(round(time.time() * 1000))))
-
+                                    
             pbar.update(1)
 
     return True, train_psnrs, val_psnrs, model
